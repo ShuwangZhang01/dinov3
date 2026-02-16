@@ -94,7 +94,7 @@ def main():
     if not paths:
         raise RuntimeError(f"No images found under: {data_dir}")
 
-    dataset_name = Path(args.data_dir).name
+    dataset_name = Path(args.data_dir).name + "_ViT"
     dataset_out = out_dir / dataset_name
     ensure_dir(dataset_out)
 
