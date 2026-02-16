@@ -16,3 +16,6 @@ dist/
 
 # Ignore vscode directory
 .vscode/
+/data
+/weights
+/output
