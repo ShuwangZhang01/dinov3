@@ -37,11 +37,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--weights", type=str, required=True)
-    parser.add_argument("--model", type=str, default="dinov3_vits16")
-    parser.add_argument("--img_size", type=int, default=448)
+    parser.add_argument("--model", type=str, default="dinov3_convnext_tiny")
+    parser.add_argument("--img_size", type=int, default=1080)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output_dir", type=str, default="output")
-    parser.add_argument("--layer", type=int, default=-1, help="Which block to use for attention (default: last block).")
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent
@@ -55,17 +54,18 @@ def main():
     if not weights_path.exists():
         raise FileNotFoundError(f"weights not found: {weights_path}")
 
-    # Load DINOv3 model
-    import hubconf  # repo hubconf.py
+    # Load model
+    import hubconf
     model_fn = getattr(hubconf, args.model)
     model = model_fn(pretrained=True, weights=str(weights_path))
     model.eval().to(args.device)
 
-    patch = model.patch_size
-    grid_h = args.img_size // patch
-    grid_w = args.img_size // patch
+    # All DINOv3 ConvNeXt models have total stride = 8
+    STRIDE = 8
+    grid_h = args.img_size // STRIDE
+    grid_w = args.img_size // STRIDE
 
-    # Preprocess (same resize/crop as your embedding script)
+    # Input transform
     tfm = transforms.Compose([
         transforms.Resize(args.img_size, interpolation=transforms.InterpolationMode.BICUBIC),
         transforms.CenterCrop(args.img_size),
@@ -74,112 +74,68 @@ def main():
                              std=(0.229, 0.224, 0.225)),
     ])
 
-    # --- Hook to capture qkv from chosen block for attention computation ---
-    qkv_cache = {}
+    # Verify output size with dummy input
+    with torch.no_grad():
+        dummy_img = torch.randn(1, 3, args.img_size, args.img_size).to(args.device)
+        feats = model.forward_features(dummy_img)
+        patch_tokens = feats["x_norm_patchtokens"]  # (B, H'*W', D)
 
-    # pick block index
-    blk_idx = args.layer if args.layer >= 0 else (len(model.blocks) + args.layer)
-    blk_idx = int(blk_idx)
-    if blk_idx < 0 or blk_idx >= len(model.blocks):
-        raise ValueError(f"layer index out of range: {args.layer} (resolved to {blk_idx})")
+    B, N, D = patch_tokens.shape
+    expected_tokens = grid_h * grid_w
+    if N != expected_tokens:
+        raise RuntimeError(
+            f"Token count mismatch: got {N}, expected {expected_tokens} ({grid_h}x{grid_w}). "
+            f"Check image size divisibility by stride={STRIDE}."
+        )
 
-    def qkv_hook(module, inp, out):
-        # out shape: (B, N, 3*C)
-        qkv_cache["qkv"] = out.detach()
+    print(f"Feature grid: {grid_h}x{grid_w} = {N} tokens (D={D})")
 
-    hook_handle = model.blocks[blk_idx].attn.qkv.register_forward_hook(qkv_hook)
+    # Dataset output path
+    dataset_name = Path(args.data_dir).name + "_CNN"
+    dataset_out = out_dir / dataset_name
+    ensure_dir(dataset_out)
 
-    # Process images
+    # Process each image
     paths = list_images(data_dir)
     if not paths:
         raise RuntimeError(f"No images found under: {data_dir}")
 
-    dataset_name = Path(args.data_dir).name + "_ViT"
-    dataset_out = out_dir / dataset_name
-    ensure_dir(dataset_out)
-
-    for p in tqdm(paths, desc="Extracting per-image feature + attention maps"):
-        # load original for overlay
+    for p in tqdm(paths, desc="Extracting CNN feature maps"):
+        # Load original image for overlay
         img_pil = Image.open(p).convert("RGB")
         img_resized = transforms.Resize(args.img_size, interpolation=transforms.InterpolationMode.BICUBIC)(img_pil)
         img_cropped = transforms.CenterCrop(args.img_size)(img_resized)
-        img_np = np.asarray(img_cropped).astype(np.float32) / 255.0  # (H,W,3)
+        img_np = np.asarray(img_cropped).astype(np.float32) / 255.0  # [0,1]
 
+        # Preprocess
         x = tfm(img_pil).unsqueeze(0).to(args.device)
 
-        # Feature map: get patch tokens from last layer and reshape to (D,H',W')
-        feats = model.forward_features(x)  # dict
-        patch_tokens = feats["x_norm_patchtokens"]  # (B, num_patches, D)
+        # Forward pass
+        feats = model.forward_features(x)
+        patch_tokens = feats["x_norm_patchtokens"]  # (1, H'*W', D)
         patch_tokens = patch_tokens[0].float().cpu().numpy()  # (P, D)
 
-        # reshape patches to grid
-        if patch_tokens.shape[0] != grid_h * grid_w:
-            # If your img_size changes or model uses different tokenization, this guards it.
-            raise RuntimeError(f"Unexpected num_patches={patch_tokens.shape[0]}, expected {grid_h*grid_w}")
+        # Reshape to spatial grid: (D, H', W')
+        feat_map = patch_tokens.reshape(grid_h, grid_w, -1).transpose(2, 0, 1)
 
-        feat_map = patch_tokens.reshape(grid_h, grid_w, -1).transpose(2, 0, 1)  # (D, H', W')
-
-        # Save feature map as .npy
+        # Save feature map (.npy)
         stem = p.stem
-        (dataset_out / f"{stem}_feat.npy").write_bytes(b"")  # ensure path exists on Windows oddities
         np.save(dataset_out / f"{stem}_feat.npy", feat_map)
 
-        # --- Attention map: recompute CLS->patch attention from cached qkv ---
-        qkv = qkv_cache.get("qkv", None)
-        if qkv is None:
-            raise RuntimeError("qkv hook did not fire; attention cache is empty.")
-
-        # qkv: (B, N, 3*C)
-        B, N, threeC = qkv.shape
-        C = threeC // 3
-        num_heads = model.num_heads
-        head_dim = C // num_heads
-        scale = head_dim ** -0.5
-
-        qkv = qkv.reshape(B, N, 3, num_heads, head_dim)
-        q = qkv[:, :, 0].permute(0, 2, 1, 3)  # (B, H, N, Dh)
-        k = qkv[:, :, 1].permute(0, 2, 1, 3)  # (B, H, N, Dh)
-
-        attn = (q @ k.transpose(-2, -1)) * scale  # (B, H, N, N)
-        attn = attn.softmax(dim=-1)
-
-        # token layout: [CLS, storage_tokens..., PATCHES...]
-        patch_start = 1 + int(getattr(model, "n_storage_tokens", 0))
-        cls_to_patches = attn[0, :, 0, patch_start:]  # (H, P)
-        cls_to_patches = cls_to_patches.mean(axis=0)  # (P,)
-
-        attn_map = cls_to_patches.reshape(grid_h, grid_w)
-        attn_map = attn_map / (attn_map.max() + 1e-8)
-        attn_map = attn_map.detach().cpu().numpy()
-
-        # Upsample attention to image size for overlay
-        attn_up = np.array(
-            Image.fromarray(to_uint8(attn_map)).resize((args.img_size, args.img_size), resample=Image.BICUBIC)
-        ).astype(np.float32) / 255.0
-
-        # Save attention overlay
-        plt.figure(figsize=(5, 5))
-        plt.imshow(img_np)
-        plt.imshow(attn_up, alpha=0.45)
-        plt.axis("off")
-        plt.tight_layout()
-        plt.savefig(dataset_out / f"{stem}_attn.png", dpi=200)
-        plt.close()
-
-        # --- Optional: quick feature-map visualization via PCA -> 3 channels ---
-        # Convert (D,H',W') to (H'*W', D), PCA->3, then upsample.
-        fm = feat_map.transpose(1, 2, 0).reshape(-1, feat_map.shape[0])  # (P, D)
-        fm3 = PCA(n_components=3, random_state=0).fit_transform(fm)  # (P,3)
-        fm3 = (fm3 - fm3.min(axis=0)) / (np.ptp(fm3, axis=0) + 1e-8)
+        # Optional: PCA visualization to RGB
+        fm_flat = feat_map.transpose(1, 2, 0).reshape(-1, feat_map.shape[0])  # (P, D)
+        fm3 = PCA(n_components=3, random_state=0).fit_transform(fm_flat)  # (P, 3)
+        fm3 = (fm3 - fm3.min(axis=0)) / (np.ptp(fm3, axis=0) + 1e-8)  # normalize
+        fm3 = np.clip(fm3, 0, 1)  # ensure valid range
         fm3 = fm3.reshape(grid_h, grid_w, 3)
+
+        # Upsample to original image size
         fm3_up = np.array(
             Image.fromarray(to_uint8(fm3)).resize((args.img_size, args.img_size), resample=Image.BICUBIC)
         )
-
         Image.fromarray(fm3_up).save(dataset_out / f"{stem}_feat_rgb.png")
 
-    hook_handle.remove()
-    print(f"\nDone. Outputs saved under: {dataset_out}")
+    print(f"\n✅ Done. Outputs saved under: {dataset_out}")
 
 
 if __name__ == "__main__":
